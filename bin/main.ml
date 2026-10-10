@@ -1,10 +1,17 @@
 (* Statistics of one numeric column of a CSV file.
-   Usage: dune exec statistics -- file.csv *)
+   Usage: dune exec statistics -- file.csv
+
+   Functional style: no mutable state and no loops. Values flow through
+   pure functions (map, filter_map, fold) and recursion. Only reading the
+   file, asking the user and printing touch the outside world. *)
 
 (* ---------- Types ---------- *)
 
 (* a numeric column: its name, its position in the row, and if it is integer *)
 type column = { name : string; index : int; is_int : bool }
+
+(* binds a result to the next step, stopping at the first error *)
+let ( let* ) = Result.bind
 
 (* ---------- Checking cells ---------- *)
 
@@ -14,121 +21,110 @@ let is_digit c = c >= '0' && c <= '9'
 (* true if the text is an integer, like 12 or -7 *)
 let is_integer text =
   let n = String.length text in
-  if n = 0 then false
-  else begin
-    let start = if text.[0] = '-' || text.[0] = '+' then 1 else 0 in
-    let ok = ref (n > start) in
-    for i = start to n - 1 do
-      if not (is_digit text.[i]) then ok := false
-    done;
-    !ok
-  end
+  n > 0
+  &&
+  let start = if text.[0] = '-' || text.[0] = '+' then 1 else 0 in
+  n > start && String.for_all is_digit (String.sub text start (n - start))
 
 (* true if the text is a decimal number, like 3.14 *)
 let is_decimal text =
-  if text = "" || String.contains text '_' then false
-  else
-    try
-      let _ = float_of_string text in
-      true
-    with Failure _ -> false
+  text <> ""
+  && (not (String.contains text '_'))
+  && Option.is_some (float_of_string_opt text)
 
 (* ---------- Reading the file ---------- *)
 
 (* removes the \r and \n at the end of a text *)
-let remove_newline text =
-  let n = ref (String.length text) in
-  while !n > 0 && (text.[!n - 1] = '\n' || text.[!n - 1] = '\r') do
-    n := !n - 1
-  done;
-  String.sub text 0 !n
+let rec remove_newline text =
+  let n = String.length text in
+  if n > 0 && (text.[n - 1] = '\n' || text.[n - 1] = '\r') then
+    remove_newline (String.sub text 0 (n - 1))
+  else text
 
-(* splits a line by commas. A comma inside quotes does not split. *)
+(* splits a line by commas. A comma inside quotes does not split.
+   The state is (finished fields, current field reversed, inside quotes). *)
 let split_line line =
-  let fields = ref [] in
-  let current = ref "" in
-  let in_quotes = ref false in
-  String.iter
-    (fun c ->
-      if c = '"' then in_quotes := not !in_quotes
-      else if c = ',' && not !in_quotes then begin
-        fields := !current :: !fields;
-        current := ""
-      end
-      else current := !current ^ String.make 1 c)
-    line;
-  fields := remove_newline !current :: !fields;
-  Array.of_list (List.rev !fields)
+  let step (fields, current, in_quotes) c =
+    if c = '"' then (fields, current, not in_quotes)
+    else if c = ',' && not in_quotes then
+      (String.of_seq (List.to_seq (List.rev current)) :: fields, [], in_quotes)
+    else (fields, c :: current, in_quotes)
+  in
+  let fields, current, _ =
+    String.fold_left step ([], [], false) line
+  in
+  let last = remove_newline (String.of_seq (List.to_seq (List.rev current))) in
+  List.rev (last :: fields)
 
 (* reads all the lines of the file into a list *)
 let read_lines path =
-  let file = open_in path in
-  let lines = ref [] in
-  (try
-     while true do
-       lines := input_line file :: !lines
-     done
-   with End_of_file -> ());
-  close_in file;
-  List.rev !lines
+  match open_in path with
+  | exception Sys_error _ -> Error "statistics: Invalid file."
+  | file ->
+      let rec loop acc =
+        match input_line file with
+        | line -> loop (line :: acc)
+        | exception End_of_file -> List.rev acc
+      in
+      let lines = loop [] in
+      close_in file;
+      Ok lines
 
 (* ---------- Columns ---------- *)
 
+(* the column described by a name and a cell, if the cell is a number *)
+let column_of index (name, cell) =
+  if is_integer cell then Some { name; index; is_int = true }
+  else if is_decimal cell then Some { name; index; is_int = false }
+  else None
+
+(* pairs each name with its cell; names without a cell are dropped *)
+let rec zip names cells =
+  match (names, cells) with
+  | name :: names, cell :: cells -> (name, cell) :: zip names cells
+  | _ -> []
+
 (* finds the numeric columns, looking at the first row of data *)
 let find_columns header_line first_line =
-  let names = split_line header_line in
-  let cells = split_line first_line in
-  let columns = ref [] in
-  for i = 0 to Array.length names - 1 do
-    if i < Array.length cells then begin
-      if is_integer cells.(i) then
-        columns := { name = names.(i); index = i; is_int = true } :: !columns
-      else if is_decimal cells.(i) then
-        columns := { name = names.(i); index = i; is_int = false } :: !columns
-    end
-  done;
-  Array.of_list (List.rev !columns)
+  zip (split_line header_line) (split_line first_line)
+  |> List.mapi column_of
+  |> List.filter_map Fun.id
 
-(* shows the columns and asks the user for one. Returns the chosen column. *)
+(* shows the columns and asks the user for one. Returns the chosen column,
+   or None when the input ends without a valid choice. *)
 let choose_column columns =
-  let total = Array.length columns in
+  let total = List.length columns in
   print_string "Select one option to return data:\n\n";
-  for i = 0 to total - 1 do
-    Printf.printf "%d: %s\n" (i + 1) columns.(i).name
-  done;
-  let chosen = ref (-1) in
-  while !chosen < 0 do
+  List.iteri (fun i c -> Printf.printf "%d: %s\n" (i + 1) c.name) columns;
+  let rec ask () =
     print_string "\nChoose an option: ";
     flush stdout;
-    let line = try input_line stdin with End_of_file -> "end" in
-    if line = "end" then begin
-      prerr_endline "statistics: no numeric column selected";
-      exit 1
-    end;
-    let text = String.trim line in
-    if is_integer text && int_of_string text >= 1 && int_of_string text <= total
-    then chosen := int_of_string text - 1
-    else Printf.printf "Invalid option, enter a number between 1 and %d.\n" total
-  done;
-  columns.(!chosen)
+    match input_line stdin with
+    | exception End_of_file -> None
+    | "end" -> None
+    | line -> (
+        let text = String.trim line in
+        match if is_integer text then int_of_string_opt text else None with
+        | Some n when n >= 1 && n <= total -> Some (List.nth columns (n - 1))
+        | _ ->
+            Printf.printf "Invalid option, enter a number between 1 and %d.\n"
+              total;
+            ask ())
+  in
+  ask ()
+
+(* the number in the cell of the column, if the cell has the right type *)
+let value_of column line =
+  match List.nth_opt (split_line line) column.index with
+  | Some cell when column.is_int && is_integer cell ->
+      Some (float_of_string cell)
+  | Some cell when (not column.is_int) && is_decimal cell ->
+      Some (float_of_string cell)
+  | _ -> None
 
 (* gets the numbers of the column from all the data lines, sorted *)
 let get_values lines column =
-  let values = ref [] in
-  List.iter
-    (fun line ->
-      let cells = split_line line in
-      if column.index < Array.length cells then begin
-        let cell = cells.(column.index) in
-        if column.is_int && is_integer cell then
-          values := float_of_string cell :: !values
-        else if (not column.is_int) && is_decimal cell then
-          values := float_of_string cell :: !values
-      end)
-    lines;
-  let array = Array.of_list !values in
-  Array.sort compare array;
-  array
+  lines |> List.filter_map (value_of column) |> List.sort compare |> Array.of_list
 
 (* ---------- Statistics ---------- *)
 
@@ -138,53 +134,44 @@ let show column value =
   else Printf.sprintf "%f" value
 
 (* the middle value. With an even count, the average of the two in the middle *)
-let print_median column values =
+let median_line column values =
   let n = Array.length values in
-  if n mod 2 = 1 then Printf.printf "Median: %s\n" (show column values.(n / 2))
-  else begin
-    let average = (values.(n / 2 - 1) +. values.(n / 2)) /. 2.0 in
-    Printf.printf "Median: %f\n" average
-  end
+  if n mod 2 = 1 then Printf.sprintf "Median: %s" (show column values.(n / 2))
+  else
+    Printf.sprintf "Median: %f" ((values.(n / 2 - 1) +. values.(n / 2)) /. 2.0)
+
+let sum values = Array.fold_left ( +. ) 0.0 values
 
 (* sum and mean *)
-let print_sum_and_mean values =
-  let sum = ref 0.0 in
-  for i = 0 to Array.length values - 1 do
-    sum := !sum +. values.(i)
-  done;
-  Printf.printf "Sum: %f\n" !sum;
-  Printf.printf "Mean: %f\n" (!sum /. float_of_int (Array.length values))
+let sum_and_mean_lines values =
+  let total = sum values in
+  [
+    Printf.sprintf "Sum: %f" total;
+    Printf.sprintf "Mean: %f" (total /. float_of_int (Array.length values));
+  ]
 
-(* the value (or values) that appear more times.
-   The array is sorted, so equal values are together. *)
-let print_mode column values =
-  let n = Array.length values in
-  (* first, find the biggest group of equal values *)
-  let best = ref 1 in
-  let i = ref 0 in
-  while !i < n do
-    let j = ref !i in
-    while !j < n && values.(!j) = values.(!i) do
-      j := !j + 1
-    done;
-    if !j - !i > !best then best := !j - !i;
-    i := !j
-  done;
-  if !best = 1 then print_endline "Mode: there is no mode"
-  else begin
-    (* then print every group that has that size *)
-    print_string "Mode:";
-    i := 0;
-    while !i < n do
-      let j = ref !i in
-      while !j < n && values.(!j) = values.(!i) do
-        j := !j + 1
-      done;
-      if !j - !i = !best then Printf.printf " %s" (show column values.(!i));
-      i := !j
-    done;
-    print_newline ()
-  end
+(* groups equal neighbours: [1;1;2] becomes [(1, 2); (2, 1)].
+   The values are sorted, so equal values are together. *)
+let runs values =
+  Array.fold_left
+    (fun acc v ->
+      match acc with
+      | (x, count) :: rest when x = v -> (x, count + 1) :: rest
+      | _ -> (v, 1) :: acc)
+    [] values
+  |> List.rev
+
+(* the value (or values) that appear more times *)
+let mode_line column values =
+  let groups = runs values in
+  let best = List.fold_left (fun m (_, count) -> max m count) 1 groups in
+  if best = 1 then "Mode: there is no mode"
+  else
+    groups
+    |> List.filter (fun (_, count) -> count = best)
+    |> List.map (fun (v, _) -> " " ^ show column v)
+    |> String.concat ""
+    |> ( ^ ) "Mode:"
 
 (* percentile p (from 0 to 100) using a line between the two closest values *)
 let percentile values p =
@@ -195,80 +182,89 @@ let percentile values p =
   let fraction = rank -. float_of_int low in
   values.(low) +. (fraction *. (values.(high) -. values.(low)))
 
-let print_quartiles values =
+let quartiles_lines values =
   let q1 = percentile values 25.0 in
   let q2 = percentile values 50.0 in
   let q3 = percentile values 75.0 in
-  Printf.printf "Q1: %f\n" q1;
-  Printf.printf "Q2: %f\n" q2;
-  Printf.printf "Q3: %f\n" q3;
-  Printf.printf "IQR: %f\n" (q3 -. q1)
+  [
+    Printf.sprintf "Q1: %f" q1;
+    Printf.sprintf "Q2: %f" q2;
+    Printf.sprintf "Q3: %f" q3;
+    Printf.sprintf "IQR: %f" (q3 -. q1);
+  ]
 
 (* population variance divides by n, sample variance divides by n - 1 *)
-let print_variance values =
-  let count = Array.length values in
-  let n = float_of_int count in
-  let sum = ref 0.0 in
-  for i = 0 to count - 1 do
-    sum := !sum +. values.(i)
-  done;
-  let mean = !sum /. n in
-  let squares = ref 0.0 in
-  for i = 0 to count - 1 do
-    let diff = values.(i) -. mean in
-    squares := !squares +. (diff *. diff)
-  done;
-  let population = !squares /. n in
-  Printf.printf "Population variance: %f\n" population;
-  Printf.printf "Population std dev: %f\n" (sqrt population);
-  if count < 2 then print_endline "Sample variance: needs at least 2 values"
-  else begin
-    let sample = !squares /. (n -. 1.0) in
-    Printf.printf "Sample variance: %f\n" sample;
-    Printf.printf "Sample std dev: %f\n" (sqrt sample)
-  end
+let variance_lines values =
+  let n = float_of_int (Array.length values) in
+  let mean = sum values /. n in
+  let squares =
+    Array.fold_left (fun acc v -> acc +. ((v -. mean) *. (v -. mean))) 0.0 values
+  in
+  let population = squares /. n in
+  let sample_lines =
+    if Array.length values < 2 then [ "Sample variance: needs at least 2 values" ]
+    else
+      let sample = squares /. (n -. 1.0) in
+      [
+        Printf.sprintf "Sample variance: %f" sample;
+        Printf.sprintf "Sample std dev: %f" (sqrt sample);
+      ]
+  in
+  [
+    Printf.sprintf "Population variance: %f" population;
+    Printf.sprintf "Population std dev: %f" (sqrt population);
+  ]
+  @ sample_lines
 
 (* the array is sorted: the smallest is the first, the biggest is the last *)
-let print_min_max column values =
+let min_max_lines column values =
   let smallest = values.(0) in
   let biggest = values.(Array.length values - 1) in
-  Printf.printf "Min: %s\n" (show column smallest);
-  Printf.printf "Max: %s\n" (show column biggest);
-  Printf.printf "Range: %f\n" (biggest -. smallest)
+  [
+    Printf.sprintf "Min: %s" (show column smallest);
+    Printf.sprintf "Max: %s" (show column biggest);
+    Printf.sprintf "Range: %f" (biggest -. smallest);
+  ]
+
+(* all the lines of the report, in order *)
+let report column values =
+  (median_line column values :: sum_and_mean_lines values)
+  @ (mode_line column values :: quartiles_lines values)
+  @ variance_lines values
+  @ min_max_lines column values
 
 (* ---------- Main ---------- *)
 
-let () =
-  if Array.length Sys.argv <> 2 then begin
-    prerr_endline "Only one argument is allowed";
-    exit 1
-  end;
-  let lines =
-    try read_lines Sys.argv.(1)
-    with Sys_error _ ->
-      prerr_endline "statistics: Invalid file.";
-      exit 1
+(* runs the whole program. Error carries the message and the exit code. *)
+let run argv =
+  let* path =
+    if Array.length argv <> 2 then Error ("Only one argument is allowed", 1)
+    else Ok argv.(1)
   in
+  let* lines = Result.map_error (fun msg -> (msg, 1)) (read_lines path) in
   (* we need the header line and at least one line of data *)
-  match lines with
-  | header_line :: first_line :: data ->
-      let columns = find_columns header_line first_line in
-      if Array.length columns = 0 then begin
-        prerr_endline "statistics: no data";
-        exit 1
-      end;
-      let column = choose_column columns in
-      let values = get_values (first_line :: data) column in
-      if Array.length values = 0 then
-        prerr_endline "statistics: the column has no valid values"
-      else begin
-        print_median column values;
-        print_sum_and_mean values;
-        print_mode column values;
-        print_quartiles values;
-        print_variance values;
-        print_min_max column values
-      end
-  | _ ->
-      prerr_endline "statistics: no data";
-      exit 1
+  let* header_line, first_line, data =
+    match lines with
+    | header_line :: first_line :: data -> Ok (header_line, first_line, data)
+    | _ -> Error ("statistics: no data", 1)
+  in
+  let* columns =
+    match find_columns header_line first_line with
+    | [] -> Error ("statistics: no data", 1)
+    | columns -> Ok columns
+  in
+  let* column =
+    Option.to_result
+      ~none:("statistics: no numeric column selected", 1)
+      (choose_column columns)
+  in
+  match get_values (first_line :: data) column with
+  | [||] -> Error ("statistics: the column has no valid values", 0)
+  | values -> Ok (report column values)
+
+let () =
+  match run Sys.argv with
+  | Ok lines -> List.iter print_endline lines
+  | Error (message, code) ->
+      prerr_endline message;
+      if code <> 0 then exit code
